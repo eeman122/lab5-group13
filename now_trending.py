@@ -43,6 +43,19 @@ events_df = events_df.withColumn("event_time", (col("timestamp") * 1000).cast(Ti
 
 # 4) Filter only "play" events
 plays_df = events_df.filter(col("action") == "play")
+skips_df = events_df.filter(col("action") == "skip")
+
+skip_ratio_df = skips_df.groupBy("song_id").count().alias("skip_count") \
+    .join(plays_df.groupBy("song_id").count().alias("play_count"), "song_id", "outer") \
+    .fillna(0) \
+    .withColumn("skip_ratio", col("skip_count") / (col("skip_count") + col("play_count")))
+
+unpopular_songs_df = skip_ratio_df.filter(col("skip_ratio") > 0.5)
+
+unpopular_songs_df.writeStream \
+    .outputMode("update") \
+    .format("console") \
+    .start()
 
 # 5) Group by region + 5-minute processing time window
 # We'll do a simple processing-time window using current_timestamp
@@ -57,9 +70,9 @@ from pyspark.sql.functions import current_timestamp
 #     ) \
 #     .count()
 windowed_df = plays_df \
-    .withWatermark("event_time", "5 minutes") \
+    .withWatermark("event_time", "10 minutes") \
     .groupBy(
-        window(col("event_time"), "5 minutes"),
+        window(col("event_time"), "10 minutes"),
         col("region"),
         col("song_id")
     ) \
@@ -84,12 +97,35 @@ def process_batch(batch_df, batch_id):
     # Show the top songs for each region + 5-min window
     print(f"=== Batch: {batch_id} ===")
     ranked_df.show(truncate=False)
+    
+from pyspark.sql.functions import to_json, struct
+
+# Convert to JSON and write to Kafka
+def process_batch(batch_df, batch_id):
+    if batch_df.rdd.isEmpty():
+        return
+
+    batch_df.select(
+        to_json(struct("region", "song_id", "count")).alias("value")
+    ).write \
+     .format("kafka") \
+     .option("kafka.bootstrap.servers", "localhost:9092") \
+     .option("topic", "now_trending_results") \
+     .save()
+
 
 # 7) Write Stream with foreachBatch
-query = windowed_df \
-    .writeStream \
+# query = windowed_df \
+#     .writeStream \
+#     .outputMode("update") \
+#     .foreachBatch(process_batch) \
+#     .start()
+    
+query = windowed_df.writeStream \
     .outputMode("update") \
     .foreachBatch(process_batch) \
+    .trigger(processingTime='1 second') \
     .start()
+
 
 query.awaitTermination()
